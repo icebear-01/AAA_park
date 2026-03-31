@@ -5,6 +5,7 @@ from collections import deque
 import numpy as np
 import torch
 
+from env.car_parking_base import CarParking
 from env.car_parking_out_base import CarParkingOut
 from env.env_wrapper import CarParkingWrapper
 from configs import (
@@ -63,6 +64,7 @@ class BidirectionalParkingAgent(object):
         self.forward_dist_history = deque(maxlen=self.forward_progress_window)
         self.forward_pos_history = deque(maxlen=self.forward_progress_window)
         self.stall_window_count = 0
+        self.initial_reachable_anchor_indices = []
         self.last_action_phase = "forward_policy"
 
     def _policy_action(self, agent, obs):
@@ -84,8 +86,10 @@ class BidirectionalParkingAgent(object):
         self.forward_dist_history.clear()
         self.forward_pos_history.clear()
         self.stall_window_count = 0
+        self.initial_reachable_anchor_indices = []
         self.last_action_phase = "forward_policy"
         self._prepare_reverse_branch(env)
+        self.initial_reachable_anchor_indices = self._reachable_anchor_indices(env)
 
     def _build_reverse_env(self, env):
         raw_env = CarParkingOut(
@@ -125,10 +129,23 @@ class BidirectionalParkingAgent(object):
     def _candidate_indices(self):
         if not self.reverse_states:
             return []
-        indices = list(range(len(self.reverse_states) - 1, -1, -self.connect_stride))
+        n_states = len(self.reverse_states)
+        dense_tail = min(4, n_states)
+        indices = list(range(n_states - 1, n_states - dense_tail - 1, -1))
+        stride_start = n_states - dense_tail - 1
+        if stride_start >= 0:
+            indices.extend(range(stride_start, -1, -self.connect_stride))
         if indices[-1] != 0:
             indices.append(0)
-        return indices
+        return list(dict.fromkeys(indices))
+
+    def _reachable_anchor_indices(self, env):
+        hits = []
+        for state_index in self._candidate_indices():
+            rs_path = env.unwrapped.find_rs_path_to_state(self.reverse_states[state_index])
+            if rs_path is not None:
+                hits.append(state_index)
+        return hits
 
     def _build_connector_actions(self, state_index):
         connector_actions = []
@@ -139,6 +156,48 @@ class BidirectionalParkingAgent(object):
 
     def _distance_to_dest(self, env):
         return env.unwrapped.vehicle.state.loc.distance(env.unwrapped.map.dest.loc)
+
+    def _clone_forward_env(self, env):
+        raw_env = CarParking(
+            fps=0,
+            verbose=False,
+            render_mode="rgb_array",
+            use_lidar_observation=env.unwrapped.use_lidar_observation,
+            use_img_observation=env.unwrapped.use_img_observation,
+            use_action_mask=env.unwrapped.use_action_mask,
+            enable_rs_assist=env.unwrapped.enable_rs_assist,
+        )
+        probe_env = CarParkingWrapper(raw_env)
+        probe_env.unwrapped.reward = env.unwrapped.reward
+        probe_env.unwrapped.prev_reward = env.unwrapped.prev_reward
+        probe_env.unwrapped.accum_arrive_reward = env.unwrapped.accum_arrive_reward
+        probe_env.unwrapped.t = env.unwrapped.t
+        probe_env.unwrapped.map = copy.deepcopy(env.unwrapped.map)
+        probe_env.unwrapped.vehicle.reset(copy.deepcopy(env.unwrapped.vehicle.state))
+        probe_env.unwrapped.matrix = probe_env.unwrapped.coord_transform_matrix()
+        return probe_env
+
+    def _should_try_initial_connect(self, obs, env):
+        if self.connection_used or self.forward_step_count != 0:
+            return False
+        if not self.initial_reachable_anchor_indices:
+            return False
+        curr_dist = self._distance_to_dest(env)
+        if curr_dist <= self.disable_connect_near_goal_dist:
+            return False
+
+        rng_state = capture_global_rng_state()
+        probe_env = None
+        try:
+            action, _ = self._policy_action(self.forward_agent, obs)
+            probe_env = self._clone_forward_env(env)
+            probe_env.step(action)
+            next_dist = self._distance_to_dest(probe_env)
+            reachable_after_probe = self._reachable_anchor_indices(probe_env)
+            return (next_dist >= curr_dist - 0.05) and (len(reachable_after_probe) == 0)
+        finally:
+            probe_env = None
+            restore_global_rng_state(rng_state)
 
     def _record_forward_progress(self, env):
         self.forward_step_count += 1
@@ -170,13 +229,15 @@ class BidirectionalParkingAgent(object):
         if progress_delta > self.stall_progress_max_delta:
             return False
 
+        net_progress = float(np.linalg.norm(pos_history[-1] - pos_history[0]))
         travel_len = 0.0
         for idx in range(len(pos_history) - 1):
             travel_len += float(np.linalg.norm(pos_history[idx + 1] - pos_history[idx]))
-        if travel_len < self.stall_min_travel:
-            return False
 
-        net_progress = float(np.linalg.norm(pos_history[-1] - pos_history[0]))
+        frozen_motion_thresh = min(self.stall_min_travel * 0.25, 0.2)
+        if travel_len < self.stall_min_travel:
+            return (travel_len <= frozen_motion_thresh) and (net_progress <= frozen_motion_thresh)
+
         progress_ratio = net_progress / max(travel_len, 1e-6)
         return progress_ratio <= self.stall_max_net_progress_ratio
 
@@ -227,6 +288,9 @@ class BidirectionalParkingAgent(object):
             action = self.connector_actions.pop(0)
             log_prob = self.forward_agent.get_log_prob(obs, action)
             return action, log_prob
+
+        if self._should_try_initial_connect(obs, env):
+            self._try_connect(env)
 
         if not self.forward_agent.executing_rs and not self.connector_actions:
             self._record_forward_progress(env)
