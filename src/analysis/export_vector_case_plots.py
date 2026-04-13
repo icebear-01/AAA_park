@@ -43,6 +43,7 @@ from model.agent.bidirectional_parking_agent import (
     capture_global_rng_state,
     restore_global_rng_state,
 )
+from model.agent.build_utils import resolve_agent_init_configs
 from model.agent.parking_agent import ParkingAgent, RsPlanner
 from model.agent.ppo_agent import PPOAgent as PPO
 from model.agent.sac_agent import SACAgent as SAC
@@ -114,17 +115,11 @@ def create_env():
 
 def build_agent(ckpt_path, env):
     agent_type = PPO if "ppo" in ckpt_path.lower() else SAC
-    configs = {
-        "discrete": False,
-        "observation_shape": env.observation_shape,
-        "action_dim": env.action_space.shape[0],
-        "hidden_size": 64,
-        "activation": "tanh",
-        "dist_type": "gaussian",
-        "save_params": False,
-        "actor_layers": ACTOR_CONFIGS,
-        "critic_layers": CRITIC_CONFIGS,
-    }
+    configs = resolve_agent_init_configs(
+        env.observation_shape,
+        env.action_space.shape[0],
+        ckpt_path=ckpt_path,
+    )
     rl_agent = agent_type(configs)
     rl_agent.load(ckpt_path, params_only=True)
     step_ratio = env.vehicle.kinetic_model.step_len * env.vehicle.kinetic_model.n_step * VALID_SPEED[1]

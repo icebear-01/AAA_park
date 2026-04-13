@@ -67,6 +67,22 @@ class BidirectionalParkingAgent(object):
         self.initial_reachable_anchor_indices = []
         self.last_action_phase = "forward_policy"
 
+    def _agent_unpark_img_mode(self, agent) -> str:
+        base_agent = getattr(agent, "agent", agent)
+        configs = getattr(base_agent, "configs", None)
+        if configs is None:
+            return "rgb"
+        img_mode = getattr(configs, "unpark_img_mode", None)
+        if img_mode is not None:
+            return str(img_mode)
+        actor_layers = getattr(configs, "actor_layers", None)
+        if actor_layers is None:
+            return "rgb"
+        img_shape = actor_layers.get("img_shape")
+        if img_shape is None:
+            return "rgb"
+        return "rgb_slot" if int(img_shape[0]) > 3 else "rgb"
+
     def _policy_action(self, agent, obs):
         agent_name = agent.agent.__class__.__name__.lower() if hasattr(agent, "agent") else agent.__class__.__name__.lower()
         if "ppo" in agent_name:
@@ -99,6 +115,7 @@ class BidirectionalParkingAgent(object):
             use_lidar_observation=env.unwrapped.use_lidar_observation,
             use_img_observation=env.unwrapped.use_img_observation,
             use_action_mask=env.unwrapped.use_action_mask,
+            img_mode=self._agent_unpark_img_mode(self.unpark_agent),
         )
         reverse_env = CarParkingWrapper(raw_env)
         raw_obs = reverse_env.unwrapped.reset_from_map(env.unwrapped.map)

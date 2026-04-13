@@ -54,6 +54,7 @@ class CarParking(gym.Env):
         use_lidar_observation: bool =USE_LIDAR,
         use_img_observation: bool=USE_IMG,
         use_action_mask: bool=USE_ACTION_MASK,
+        img_extra_channels: int = 0,
         enable_rs_assist: bool = True,
     ):
         super().__init__()
@@ -62,6 +63,7 @@ class CarParking(gym.Env):
         self.use_lidar_observation = use_lidar_observation
         self.use_img_observation = use_img_observation
         self.use_action_mask = use_action_mask
+        self.img_extra_channels = int(img_extra_channels) if use_img_observation else 0
         self.enable_rs_assist = enable_rs_assist
         self.render_mode = "human" if render_mode is None else render_mode
         self.fps = fps
@@ -96,7 +98,7 @@ class CarParking(gym.Env):
                 shape=(N_DISCRETE_ACTION,), dtype=np.float64
             )
         if self.use_img_observation:
-            self.img_processor = Obs_Processor()
+            self.img_processor = Obs_Processor(extra_channels=self.img_extra_channels)
             self.observation_space['img'] = spaces.Box(low=0, high=255, 
                 shape=(OBS_W//self.img_processor.downsample_rate, OBS_H//self.img_processor.downsample_rate, 
                 self.img_processor.n_channels), dtype=np.uint8
@@ -328,7 +330,13 @@ class CarParking(gym.Env):
                 pygame.draw.polygon(
                     surface, TRAJ_COLORS[-(render_len-i)], self._coord_transform(vehicle_box))
 
-    def _get_img_observation(self, surface: pygame.Surface):
+    def _surface_to_rgb_array(self, surface: pygame.Surface):
+        obs_str = pygame.image.tostring(surface, "RGB")
+        observation = np.frombuffer(obs_str, dtype=np.uint8)
+        observation = observation.reshape(self.raw_img_shape)
+        return observation
+
+    def _capture_ego_aligned_surface(self, surface: pygame.Surface, background_color=BG_COLOR):
         angle = self.vehicle.state.heading
         old_center = surface.get_rect().center
 
@@ -346,16 +354,15 @@ class CarParking(gym.Env):
         # align the center of the observation with the center of the vehicle
         observation = pygame.Surface((WIN_W, WIN_H))
     
-        observation.fill(BG_COLOR)
+        observation.fill(background_color)
         observation.blit(rotate, (int(-dx), int(-dy)))
         observation = observation.subsurface((
             (WIN_W-OBS_W)/2, (WIN_H-OBS_H)/2), (OBS_W, OBS_H))
+        return observation
 
-    
-        obs_str = pygame.image.tostring(observation, "RGB")
-        observation = np.frombuffer(obs_str, dtype=np.uint8)
-        observation = observation.reshape(self.raw_img_shape)
-
+    def _get_img_observation(self, surface: pygame.Surface):
+        observation = self._capture_ego_aligned_surface(surface)
+        observation = self._surface_to_rgb_array(observation)
         return observation
 
     def _process_img_observation(self, img):
@@ -372,6 +379,9 @@ class CarParking(gym.Env):
         '''
         processed_img = self.img_processor.process_img(img)
         return processed_img
+
+    def _get_img_extra_channels(self):
+        return None
 
     def _get_lidar_observation(self,):
         obs_list = [obs.shape for obs in self.map.obstacles]
@@ -411,6 +421,9 @@ class CarParking(gym.Env):
         if self.use_img_observation:
             raw_observation = self._get_img_observation(self.screen)
             observation['img'] = self._process_img_observation(raw_observation)
+            extra_img_channels = self._get_img_extra_channels()
+            if extra_img_channels is not None:
+                observation['img'] = np.concatenate((observation['img'], extra_img_channels), axis=-1)
         if self.use_lidar_observation:
             observation['lidar'] = self._get_lidar_observation()
         if self.use_action_mask:

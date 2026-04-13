@@ -1,12 +1,20 @@
+import numpy as np
+import pygame
+
 from env.car_parking_base import CarParking
 from env.task_utils import calc_iou, clone_map, swap_start_dest
 from env.vehicle import Status
+from model.agent.build_utils import normalize_unpark_img_mode
 from configs import (
+    UNPARK_IMG_MODE,
     UNPARK_SLOT_BUFFER,
     UNPARK_SUCCESS_IOU,
     UNPARK_IOU_STAGE_THRESHOLDS,
     UNPARK_IOU_STAGE_REWARDS,
     UNPARK_IOU_PROGRESS_SCALE,
+    UNPARK_USE_SLOT_CHANNEL,
+    WIN_W,
+    WIN_H,
 )
 
 
@@ -16,8 +24,13 @@ class CarParkingOut(CarParking):
                  iou_stage_thresholds=UNPARK_IOU_STAGE_THRESHOLDS,
                  iou_stage_rewards=UNPARK_IOU_STAGE_REWARDS,
                  iou_progress_scale: float = UNPARK_IOU_PROGRESS_SCALE,
+                 img_mode: str = UNPARK_IMG_MODE,
+                 use_slot_channel: bool = UNPARK_USE_SLOT_CHANNEL,
                  **kwargs):
+        self.img_mode = normalize_unpark_img_mode(img_mode, use_slot_channel=use_slot_channel)
+        self.use_slot_channel = self.img_mode == "rgb_slot"
         kwargs.setdefault("enable_rs_assist", False)
+        kwargs["img_extra_channels"] = int(self.use_slot_channel)
         super().__init__(*args, **kwargs)
         self.slot_buffer = slot_buffer
         self.success_iou_threshold = success_iou_threshold
@@ -87,6 +100,43 @@ class CarParkingOut(CarParking):
 
         self.best_slot_iou = min(prev_best_iou, current_iou)
         return current_iou, best_iou_improvement, milestone_reward, triggered_milestones, prev_best_iou
+
+    def _mask_from_surface(self, surface):
+        crop = self._capture_ego_aligned_surface(surface, background_color=(0, 0, 0))
+        mask = self._surface_to_rgb_array(crop)[..., 0]
+        return self.img_processor.process_mask(mask)
+
+    def _shape_mask(self, shape_or_area):
+        shape = shape_or_area.shape if hasattr(shape_or_area, "shape") else shape_or_area
+        surface = pygame.Surface((WIN_W, WIN_H))
+        surface.fill((0, 0, 0))
+        pygame.draw.polygon(surface, (255, 255, 255), self._coord_transform(shape))
+        return self._mask_from_surface(surface)
+
+    def _obstacle_mask(self):
+        surface = pygame.Surface((WIN_W, WIN_H))
+        surface.fill((0, 0, 0))
+        for obstacle in self.map.obstacles:
+            shape = obstacle.shape if hasattr(obstacle, "shape") else obstacle
+            pygame.draw.polygon(surface, (255, 255, 255), self._coord_transform(shape))
+        return self._mask_from_surface(surface)
+
+    def _occ_grid_observation(self):
+        obstacle_mask = self._obstacle_mask()
+        slot_mask = self._shape_mask(self.slot_box)
+        ego_mask = self._shape_mask(self.vehicle.box)
+        return np.concatenate((obstacle_mask, slot_mask, ego_mask), axis=-1)
+
+    def _process_img_observation(self, img):
+        if self.img_mode == "occ_grid":
+            return self._occ_grid_observation()
+        return super()._process_img_observation(img)
+
+    def _get_img_extra_channels(self):
+        if not (self.use_img_observation and self.use_slot_channel and self.slot_box is not None):
+            return None
+
+        return self._shape_mask(self.slot_box)
 
     def step(self, action=None):
         observation, reward_info, status, info = super().step(action)

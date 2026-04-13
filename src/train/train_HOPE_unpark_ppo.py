@@ -20,6 +20,13 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+from model.agent.build_utils import (
+    clone_network_configs,
+    configure_unpark_img_mode,
+    infer_unpark_img_mode_from_ckpt,
+    normalize_unpark_img_mode,
+    resolve_agent_init_configs,
+)
 from model.agent.ppo_agent import PPOAgent as PPO
 from model.agent.parking_agent import ParkingAgent
 from env.car_parking_out_base import CarParkingOut
@@ -105,34 +112,49 @@ def make_save_path():
     return save_path
 
 
-def build_env_kwargs(visualize, verbose):
+def resolve_unpark_img_mode(agent_ckpt, img_mode, use_slot_channel):
+    normalized_mode = normalize_unpark_img_mode(img_mode, use_slot_channel=use_slot_channel)
+    if agent_ckpt is None:
+        return normalized_mode
+
+    inferred_mode = infer_unpark_img_mode_from_ckpt(agent_ckpt)
+    if inferred_mode is None:
+        return normalized_mode
+    if inferred_mode != normalized_mode:
+        print("override `img_mode` to %s based on checkpoint config" % inferred_mode)
+    return inferred_mode
+
+
+def build_env_kwargs(visualize, verbose, img_mode=UNPARK_IMG_MODE):
     if visualize:
-        return {"fps": 100, "verbose": verbose}
-    return {"fps": 0, "verbose": verbose, "render_mode": "rgb_array"}
+        return {"fps": 100, "verbose": verbose, "img_mode": img_mode}
+    return {"fps": 0, "verbose": verbose, "render_mode": "rgb_array", "img_mode": img_mode}
 
 
-def make_env(visualize, verbose):
-    return CarParkingWrapper(CarParkingOut(**build_env_kwargs(visualize, verbose)))
+def make_env(visualize, verbose, img_mode=UNPARK_IMG_MODE):
+    return CarParkingWrapper(CarParkingOut(**build_env_kwargs(visualize, verbose, img_mode)))
 
 
 def build_agent(observation_shape, action_dim, args):
-    configs = {
-        "discrete": False,
-        "observation_shape": observation_shape,
-        "action_dim": action_dim,
-        "hidden_size": 64,
-        "activation": "tanh",
-        "dist_type": "gaussian",
-        "save_params": False,
-        "actor_layers": ACTOR_CONFIGS,
-        "critic_layers": CRITIC_CONFIGS,
-    }
+    actor_layers, critic_layers = clone_network_configs()
+    actor_layers, critic_layers = configure_unpark_img_mode(actor_layers, critic_layers, args.img_mode)
+    configs = resolve_agent_init_configs(
+        observation_shape,
+        action_dim,
+        ckpt_path=args.agent_ckpt,
+        actor_layers=actor_layers,
+        critic_layers=critic_layers,
+        extra_configs={"unpark_img_mode": args.img_mode},
+    )
 
     rl_agent = PPO(configs)
     if args.agent_ckpt is not None:
         rl_agent.load(args.agent_ckpt, params_only=True)
         print("load pre-trained model!")
-    if USE_IMG and args.img_ckpt is not None and os.path.exists(args.img_ckpt):
+    elif USE_IMG and args.img_ckpt is not None and os.path.exists(args.img_ckpt):
+        if args.img_mode != "rgb":
+            print("skip loading pretrained image encoder for img_mode=%s" % args.img_mode)
+            return rl_agent
         rl_agent.load_img_encoder(args.img_ckpt, require_grad=UPDATE_IMG_ENCODE)
     return rl_agent
 
@@ -324,7 +346,7 @@ def train_parallel_env(args, rl_agent, parallel_env, writer, save_path, level_ch
 
 
 def run_evaluation(args, rl_agent, train_levels, save_path):
-    eval_env = make_env(False, args.verbose)
+    eval_env = make_env(False, args.verbose, args.img_mode)
     eval_path = save_path + "/eval"
     os.makedirs(eval_path, exist_ok=True)
     eval_agent = ParkingAgent(rl_agent, None)
@@ -346,9 +368,13 @@ if __name__ == "__main__":
     parser.add_argument("--levels", type=str, default="Complex,Extrem")
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--start_method", type=str, default="spawn")
+    parser.add_argument("--img_mode", type=str, default=UNPARK_IMG_MODE)
+    parser.add_argument("--use_slot_channel", type=str2bool, default=UNPARK_USE_SLOT_CHANNEL)
     parser.add_argument("--verbose", type=str2bool, default=True)
     parser.add_argument("--visualize", type=str2bool, default=True)
     args = parser.parse_args()
+    args.img_mode = resolve_unpark_img_mode(args.agent_ckpt, args.img_mode, args.use_slot_channel)
+    args.use_slot_channel = args.img_mode == "rgb_slot"
 
     if args.visualize and args.num_envs > 1:
         raise ValueError("Parallel env rollout requires `--visualize False`")
@@ -368,14 +394,14 @@ if __name__ == "__main__":
         if args.num_envs > 1:
             parallel_env = ParallelCarParkingOutEnv(
                 args.num_envs,
-                env_kwargs=build_env_kwargs(args.visualize, args.verbose),
+                env_kwargs=build_env_kwargs(args.visualize, args.verbose, args.img_mode),
                 base_seed=SEED,
                 start_method=args.start_method,
             )
             observation_shape = parallel_env.observation_shape
             action_dim = parallel_env.action_dim
         else:
-            env = make_env(args.visualize, args.verbose)
+            env = make_env(args.visualize, args.verbose, args.img_mode)
             env.action_space.seed(SEED)
             observation_shape = env.observation_shape
             action_dim = env.action_space.shape[0]
