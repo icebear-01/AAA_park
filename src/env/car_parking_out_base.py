@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pygame
 
@@ -42,6 +44,8 @@ class CarParkingOut(CarParking):
         self.slot_box = None
         self.best_slot_iou = None
         self.triggered_iou_stages = set()
+        self._cached_obstacle_surface = None
+        self._cached_slot_surface = None
 
     def _reset_bookkeeping(self):
         self.reward = 0.0
@@ -50,11 +54,32 @@ class CarParkingOut(CarParking):
         self.t = 0.0
         self.best_slot_iou = None
         self.triggered_iou_stages = set()
+        self._cached_obstacle_surface = None
+        self._cached_slot_surface = None
 
     def _prepare_unparking_task(self):
         # The original parking goal is the narrow slot to escape from.
         self.slot_box = self.map.dest_box
         swap_start_dest(self.map)
+
+    def _build_mask_surface(self, shape_or_area):
+        shape = shape_or_area.shape if hasattr(shape_or_area, "shape") else shape_or_area
+        surface = pygame.Surface((WIN_W, WIN_H))
+        surface.fill((0, 0, 0))
+        pygame.draw.polygon(surface, (255, 255, 255), self._coord_transform(shape))
+        return surface
+
+    def _cache_occ_grid_surfaces(self):
+        if self.img_mode != "occ_grid":
+            return
+
+        obstacle_surface = pygame.Surface((WIN_W, WIN_H))
+        obstacle_surface.fill((0, 0, 0))
+        for obstacle in self.map.obstacles:
+            shape = obstacle.shape if hasattr(obstacle, "shape") else obstacle
+            pygame.draw.polygon(obstacle_surface, (255, 255, 255), self._coord_transform(shape))
+        self._cached_obstacle_surface = obstacle_surface
+        self._cached_slot_surface = None if self.slot_box is None else self._build_mask_surface(self.slot_box)
 
     def reset(self, case_id: int = None, data_dir: str = None, level: str = None):
         self._reset_bookkeeping()
@@ -66,6 +91,7 @@ class CarParkingOut(CarParking):
         self.vehicle.reset(self.map.start)
         self.best_slot_iou = calc_iou(self.vehicle.box, self.slot_box)
         self.matrix = self.coord_transform_matrix()
+        self._cache_occ_grid_surfaces()
         return self.step()[0]
 
     def reset_from_map(self, map_obj):
@@ -76,6 +102,7 @@ class CarParkingOut(CarParking):
         self.vehicle.reset(self.map.start)
         self.best_slot_iou = calc_iou(self.vehicle.box, self.slot_box)
         self.matrix = self.coord_transform_matrix()
+        self._cache_occ_grid_surfaces()
         return self.step()[0]
 
     def _check_arrived(self):
@@ -107,23 +134,21 @@ class CarParkingOut(CarParking):
         return self.img_processor.process_mask(mask)
 
     def _shape_mask(self, shape_or_area):
-        shape = shape_or_area.shape if hasattr(shape_or_area, "shape") else shape_or_area
-        surface = pygame.Surface((WIN_W, WIN_H))
-        surface.fill((0, 0, 0))
-        pygame.draw.polygon(surface, (255, 255, 255), self._coord_transform(shape))
-        return self._mask_from_surface(surface)
+        return self._mask_from_surface(self._build_mask_surface(shape_or_area))
 
     def _obstacle_mask(self):
-        surface = pygame.Surface((WIN_W, WIN_H))
-        surface.fill((0, 0, 0))
-        for obstacle in self.map.obstacles:
-            shape = obstacle.shape if hasattr(obstacle, "shape") else obstacle
-            pygame.draw.polygon(surface, (255, 255, 255), self._coord_transform(shape))
-        return self._mask_from_surface(surface)
+        if self._cached_obstacle_surface is None:
+            self._cache_occ_grid_surfaces()
+        return self._mask_from_surface(self._cached_obstacle_surface)
+
+    def _slot_mask(self):
+        if self._cached_slot_surface is None and self.slot_box is not None:
+            self._cached_slot_surface = self._build_mask_surface(self.slot_box)
+        return None if self._cached_slot_surface is None else self._mask_from_surface(self._cached_slot_surface)
 
     def _occ_grid_observation(self):
         obstacle_mask = self._obstacle_mask()
-        slot_mask = self._shape_mask(self.slot_box)
+        slot_mask = self._slot_mask()
         ego_mask = self._shape_mask(self.vehicle.box)
         return np.concatenate((obstacle_mask, slot_mask, ego_mask), axis=-1)
 
@@ -137,6 +162,39 @@ class CarParkingOut(CarParking):
             return None
 
         return self._shape_mask(self.slot_box)
+
+    def render(self, mode: str = "human"):
+        if self.img_mode != "occ_grid":
+            return super().render(mode)
+
+        assert mode in self.metadata["render_mode"]
+        assert self.vehicle is not None
+
+        if mode == "human":
+            display_flags = pygame.SHOWN
+        else:
+            if not os.environ.get("DISPLAY") and not os.environ.get("SDL_VIDEODRIVER"):
+                os.environ["SDL_VIDEODRIVER"] = "dummy"
+            display_flags = pygame.HIDDEN
+        if self.screen is None:
+            pygame.init()
+            pygame.display.init()
+            self.screen = pygame.display.set_mode((WIN_W, WIN_H), flags=display_flags)
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
+
+        self._render(self.screen)
+        observation = {'img': None, 'lidar': None, 'target': None, 'action_mask': None}
+        if self.use_img_observation:
+            observation['img'] = self._occ_grid_observation()
+        if self.use_lidar_observation:
+            observation['lidar'] = self._get_lidar_observation()
+        if self.use_action_mask:
+            observation['action_mask'] = self.action_filter.get_steps(observation['lidar'])
+        observation['target'] = self._get_targt_repr()
+        pygame.display.update()
+        self.clock.tick(self.fps)
+        return observation
 
     def step(self, action=None):
         observation, reward_info, status, info = super().step(action)
