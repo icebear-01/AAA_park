@@ -1,5 +1,6 @@
 
 import pickle
+from pathlib import Path
 
 import numpy as np
 from numpy.random import randn, random
@@ -13,8 +14,9 @@ from configs import *
 
 
 class ParkingMapDLP(object):
+    _DEFAULT_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "dlp.data"
     default = {
-        'path': '../data/dlp.data'
+        'path': str(_DEFAULT_DATA_PATH)
     }
     def __init__(self):
 

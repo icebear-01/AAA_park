@@ -34,7 +34,7 @@ from env.parking_map_normal import ParkingMapNormal
 from env.parking_map_dlp import ParkingMapDLP
 import env.reeds_shepp as rsCurve
 from env.observation_processor import Obs_Processor
-from model.action_mask import ActionMask
+from model.action_mask import get_cached_action_mask
 from configs import *
 
 class CarParking(gym.Env):
@@ -93,7 +93,7 @@ class CarParking(gym.Env):
        
         self.observation_space = {}
         if self.use_action_mask:
-            self.action_filter = ActionMask()
+            self.action_filter = get_cached_action_mask()
             self.observation_space['action_mask'] = spaces.Box(low=0, high=1, 
                 shape=(N_DISCRETE_ACTION,), dtype=np.float64
             )
@@ -403,17 +403,14 @@ class CarParking(gym.Env):
         assert mode in self.metadata["render_mode"]
         assert self.vehicle is not None
 
-        if mode == "human":
-            display_flags = pygame.SHOWN
-        else:
-            if not os.environ.get("DISPLAY") and not os.environ.get("SDL_VIDEODRIVER"):
-                os.environ["SDL_VIDEODRIVER"] = "dummy"
-            display_flags = pygame.HIDDEN
         if self.screen is None:
             pygame.init()
-            pygame.display.init()
-            self.screen = pygame.display.set_mode((WIN_W, WIN_H), flags = display_flags)
-        if self.clock is None:
+            if mode == "human":
+                pygame.display.init()
+                self.screen = pygame.display.set_mode((WIN_W, WIN_H), flags=pygame.SHOWN)
+            else:
+                self.screen = pygame.Surface((WIN_W, WIN_H))
+        if self.clock is None and mode == "human":
             self.clock = pygame.time.Clock()
 
         self._render(self.screen)
@@ -429,8 +426,9 @@ class CarParking(gym.Env):
         if self.use_action_mask:
             observation['action_mask'] = self.action_filter.get_steps(observation['lidar'])
         observation['target'] = self._get_targt_repr()
-        pygame.display.update()
-        self.clock.tick(self.fps)
+        if mode == "human":
+            pygame.display.update()
+            self.clock.tick(self.fps)
         
         return observation
 

@@ -5,6 +5,9 @@ from scipy.ndimage.filters import minimum_filter1d
 
 from configs import *
 
+
+_ACTION_MASK_CACHE = {}
+
 class ActionMask():
     def __init__(self, VehicleBox=VehicleBox, n_iter=10) -> None:
         print('initializing action mask')
@@ -225,3 +228,12 @@ class ActionMask():
         actions = np.arange(len(possible_actions))
         action_chosen = np.random.choice(actions, p=prob_softmax)
         return possible_actions[action_chosen]
+
+
+def get_cached_action_mask(VehicleBox=VehicleBox, n_iter=10):
+    key = (id(VehicleBox), int(n_iter))
+    action_mask = _ACTION_MASK_CACHE.get(key)
+    if action_mask is None:
+        action_mask = ActionMask(VehicleBox=VehicleBox, n_iter=n_iter)
+        _ACTION_MASK_CACHE[key] = action_mask
+    return action_mask

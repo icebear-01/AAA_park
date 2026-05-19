@@ -10,7 +10,7 @@ from model.agent_base import ConfigBase, AgentBase
 from model.network import *
 from model.replay_memory import ReplayMemory
 from model.state_norm import StateNorm
-from model.action_mask import ActionMask
+from model.action_mask import get_cached_action_mask
 
 
 class PPOConfig(ConfigBase):
@@ -51,7 +51,7 @@ class PPOAgent(AgentBase):
 
         super().__init__(PPOConfig, configs, verbose, save_params, load_params)
         self.discrete = discrete
-        self.action_filter = ActionMask()
+        self.action_filter = get_cached_action_mask()
 
         # debug
         self.actor_loss_list = []

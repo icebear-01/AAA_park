@@ -3,6 +3,8 @@ import time
 import os
 from shutil import copyfile
 import argparse
+import csv
+import random
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
@@ -246,7 +248,107 @@ def handle_episode_end(rl_agent, writer, save_path, level_chooser, succ_record, 
     return best_joint_success_rate
 
 
-def train_single_env(args, rl_agent, env, writer, save_path, level_chooser):
+def _capture_rng_state():
+    state = {
+        "np": np.random.get_state(),
+        "random": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state):
+    np.random.set_state(state["np"])
+    random.setstate(state["random"])
+    torch.set_rng_state(state["torch"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def run_fixed_seed_evaluation(args, rl_agent, train_levels, completed_episodes, save_path, writer):
+    if args.fixed_eval_episodes <= 0:
+        return
+
+    rng_state = _capture_rng_state()
+    eval_env = make_env(False, False, args.img_mode)
+    eval_agent = ParkingAgent(rl_agent, None)
+    eval_rows = []
+    was_training_actor = rl_agent.actor_net.training
+    was_training_critic = rl_agent.critic_net.training
+    rl_agent.actor_net.eval()
+    rl_agent.critic_net.eval()
+
+    try:
+        with torch.no_grad():
+            for level_idx, level in enumerate(train_levels):
+                success_count = 0
+                reward_values = []
+                step_values = []
+                for eval_idx in range(args.fixed_eval_episodes):
+                    seed = int(args.fixed_eval_seed + level_idx * 100000 + eval_idx)
+                    np.random.seed(seed)
+                    random.seed(seed)
+                    torch.manual_seed(seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(seed)
+
+                    obs = eval_env.reset(None, None, level)
+                    eval_agent.reset()
+                    done = False
+                    total_reward = 0.0
+                    step_num = 0
+                    info = {"status": None}
+                    while not done:
+                        step_num += 1
+                        action, _ = eval_agent.choose_action(obs)
+                        obs, reward, done, info = eval_env.step(action)
+                        total_reward += reward
+
+                    success = int(info["status"] == Status.ARRIVED)
+                    success_count += success
+                    reward_values.append(total_reward)
+                    step_values.append(step_num)
+
+                success_rate = success_count / max(args.fixed_eval_episodes, 1)
+                avg_reward = float(np.mean(reward_values)) if reward_values else 0.0
+                avg_step = float(np.mean(step_values)) if step_values else 0.0
+                eval_rows.append((level, success_rate, avg_reward, avg_step))
+                writer.add_scalar("fixed_eval_success_rate_%s" % level, success_rate, completed_episodes)
+                writer.add_scalar("fixed_eval_reward_%s" % level, avg_reward, completed_episodes)
+
+            joint_success_rate = min(row[1] for row in eval_rows)
+            mean_success_rate = float(np.mean([row[1] for row in eval_rows]))
+            writer.add_scalar("fixed_eval_success_rate_joint", joint_success_rate, completed_episodes)
+            writer.add_scalar("fixed_eval_success_rate_mean", mean_success_rate, completed_episodes)
+
+            csv_path = os.path.join(save_path, "fixed_eval_metrics.csv")
+            need_header = not os.path.exists(csv_path)
+            with open(csv_path, "a", newline="") as f:
+                csv_writer = csv.writer(f)
+                if need_header:
+                    csv_writer.writerow(["episode", "level", "success_rate", "avg_reward", "avg_step"])
+                for level, success_rate, avg_reward, avg_step in eval_rows:
+                    csv_writer.writerow([completed_episodes, level, success_rate, avg_reward, avg_step])
+    finally:
+        eval_env.close()
+        if was_training_actor:
+            rl_agent.actor_net.train()
+        if was_training_critic:
+            rl_agent.critic_net.train()
+        _restore_rng_state(rng_state)
+
+
+def maybe_run_fixed_seed_evaluation(args, rl_agent, train_levels, completed_episodes, save_path, writer):
+    if args.fixed_eval_interval <= 0:
+        return
+    if completed_episodes % args.fixed_eval_interval != 0:
+        return
+    run_fixed_seed_evaluation(args, rl_agent, train_levels, completed_episodes, save_path, writer)
+
+
+def train_single_env(args, rl_agent, env, writer, save_path, level_chooser, train_levels):
     reward_list = []
     reward_per_state_list = []
     succ_record = []
@@ -286,9 +388,10 @@ def train_single_env(args, rl_agent, env, writer, save_path, level_chooser):
             best_joint_success_rate,
             args.verbose,
         )
+        maybe_run_fixed_seed_evaluation(args, rl_agent, train_levels, episode_idx, save_path, writer)
 
 
-def train_parallel_env(args, rl_agent, parallel_env, writer, save_path, level_chooser):
+def train_parallel_env(args, rl_agent, parallel_env, writer, save_path, level_chooser, train_levels):
     reward_list = []
     reward_per_state_list = []
     succ_record = []
@@ -335,6 +438,7 @@ def train_parallel_env(args, rl_agent, parallel_env, writer, save_path, level_ch
                 best_joint_success_rate,
                 args.verbose,
             )
+            maybe_run_fixed_seed_evaluation(args, rl_agent, train_levels, completed_episodes, save_path, writer)
 
             if completed_episodes >= args.train_episode:
                 continue
@@ -372,6 +476,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_slot_channel", type=str2bool, default=UNPARK_USE_SLOT_CHANNEL)
     parser.add_argument("--verbose", type=str2bool, default=True)
     parser.add_argument("--visualize", type=str2bool, default=True)
+    parser.add_argument("--fixed_eval_interval", type=int, default=0)
+    parser.add_argument("--fixed_eval_episodes", type=int, default=50)
+    parser.add_argument("--fixed_eval_seed", type=int, default=20260503)
     args = parser.parse_args()
     args.img_mode = resolve_unpark_img_mode(args.agent_ckpt, args.img_mode, args.use_slot_channel)
     args.use_slot_channel = args.img_mode == "rgb_slot"
@@ -410,9 +517,9 @@ if __name__ == "__main__":
         level_chooser = LevelChoose(train_levels)
 
         if args.num_envs > 1:
-            train_parallel_env(args, rl_agent, parallel_env, writer, save_path, level_chooser)
+            train_parallel_env(args, rl_agent, parallel_env, writer, save_path, level_chooser, train_levels)
         else:
-            train_single_env(args, rl_agent, env, writer, save_path, level_chooser)
+            train_single_env(args, rl_agent, env, writer, save_path, level_chooser, train_levels)
 
         run_evaluation(args, rl_agent, train_levels, save_path)
     finally:

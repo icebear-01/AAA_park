@@ -5,7 +5,20 @@ import os
 
 import numpy as np
 import torch
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+
+def _resolve_runtime_device():
+    requested = os.environ.get("HOPE_DEVICE")
+    if requested:
+        requested = requested.strip()
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            print(f"[configs] HOPE_DEVICE={requested} requested, but CUDA is unavailable. Falling back to CPU.")
+            return torch.device("cpu")
+        return torch.device(requested)
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+
+device = _resolve_runtime_device()
 SEED = 42
 
 #########################

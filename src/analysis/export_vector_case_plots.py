@@ -95,6 +95,13 @@ DISPLAY_FOOTPRINT_LINE_COLOR = "#F1D400"
 DISPLAY_FOOTPRINT_START_COLOR = "#24C7B8"
 DISPLAY_FOOTPRINT_END_COLOR = "#2F6CF6"
 DISPLAY_FOOTPRINT_EDGE = "#13CFE3"
+DISPLAY_FOOTPRINT_OUTLINE_ONLY = False
+DISPLAY_SKIP_START_FOOTPRINT = False
+DISPLAY_FOOTPRINT_PATH_LINEWIDTH = 1.55
+DISPLAY_FOOTPRINT_OUTLINE_LINEWIDTH = 1.20
+DISPLAY_FOOTPRINT_OUTLINE_FINAL_LINEWIDTH = 1.35
+DISPLAY_FOOTPRINT_FILL_LINEWIDTH = 1.05
+DISPLAY_FOOTPRINT_FILL_FINAL_LINEWIDTH = 1.20
 
 
 def str2bool(value):
@@ -230,6 +237,7 @@ def run_single_case(map_obj, ckpt_path, action_seed):
     rs_assist_used = False
     segments = []
     phase_counts = {phase: 0 for phase in PHASE_ORDER}
+    rollout_t0 = time.perf_counter()
 
     while not done:
         step_num += 1
@@ -253,12 +261,18 @@ def run_single_case(map_obj, ckpt_path, action_seed):
             rs_assist_used = True
             agent.set_planner_path(info["path_to_dest"])
 
+    rollout_elapsed_ms = (time.perf_counter() - rollout_t0) * 1000.0
+
     result = {
         "method": "single",
         "status": info["status"].name,
         "final_success": bool(info["status"] == Status.ARRIVED),
         "planning_success": bool(info["status"] == Status.ARRIVED),
         "step_num": step_num,
+        "inference_time_ms": float(rollout_elapsed_ms),
+        "prepare_time_ms": 0.0,
+        "rollout_time_ms": float(rollout_elapsed_ms),
+        "avg_step_time_ms": float(rollout_elapsed_ms / max(step_num, 1)),
         "rs_assist_used": rs_assist_used,
         "trajectory_states": [state_to_dict(state) for state in env.unwrapped.vehicle.trajectory],
         "segments": segments,
@@ -279,7 +293,9 @@ def run_dual_case(map_obj, forward_ckpt, unpark_ckpt, action_seed):
     forward_rng_state = capture_global_rng_state()
     unpark_agent = build_agent(unpark_ckpt, env)
     agent = BidirectionalParkingAgent(forward_agent, unpark_agent)
+    prepare_t0 = time.perf_counter()
     agent.reset(env)
+    prepare_elapsed_ms = (time.perf_counter() - prepare_t0) * 1000.0
     restore_global_rng_state(forward_rng_state)
 
     done = False
@@ -287,6 +303,7 @@ def run_dual_case(map_obj, forward_ckpt, unpark_ckpt, action_seed):
     connection_step = None
     segments = []
     phase_counts = {phase: 0 for phase in PHASE_ORDER}
+    rollout_t0 = time.perf_counter()
 
     while not done:
         step_num += 1
@@ -313,6 +330,9 @@ def run_dual_case(map_obj, forward_ckpt, unpark_ckpt, action_seed):
         if info["path_to_dest"] is not None and not agent.connection_used:
             agent.forward_agent.set_planner_path(info["path_to_dest"])
 
+    rollout_elapsed_ms = (time.perf_counter() - rollout_t0) * 1000.0
+    total_elapsed_ms = prepare_elapsed_ms + rollout_elapsed_ms
+
     result = {
         "method": "dual",
         "status": info["status"].name,
@@ -322,6 +342,10 @@ def run_dual_case(map_obj, forward_ckpt, unpark_ckpt, action_seed):
         "connection_index": agent.connection_index,
         "connection_step": connection_step,
         "step_num": step_num,
+        "inference_time_ms": float(total_elapsed_ms),
+        "prepare_time_ms": float(prepare_elapsed_ms),
+        "rollout_time_ms": float(rollout_elapsed_ms),
+        "avg_step_time_ms": float(total_elapsed_ms / max(step_num, 1)),
         "trajectory_states": [state_to_dict(state) for state in env.unwrapped.vehicle.trajectory],
         "segments": segments,
         "phase_steps": phase_counts,
@@ -456,6 +480,8 @@ def sampled_trajectory_indices(traj_states, stride=DISPLAY_FOOTPRINT_STRIDE):
     indices = list(range(0, len(traj_states), max(int(stride), 1)))
     if indices[-1] != len(traj_states) - 1:
         indices.append(len(traj_states) - 1)
+    if DISPLAY_SKIP_START_FOOTPRINT and len(indices) > 1 and indices[0] == 0:
+        indices = indices[1:]
     return indices
 
 
@@ -467,7 +493,7 @@ def draw_footprint_trajectory(ax, traj_states, zorder_base=6, stride=DISPLAY_FOO
             smoothed_trajectory[:, 0],
             smoothed_trajectory[:, 1],
             color=DISPLAY_FOOTPRINT_LINE_COLOR,
-            linewidth=1.55,
+            linewidth=DISPLAY_FOOTPRINT_PATH_LINEWIDTH,
             alpha=0.98,
             zorder=zorder_base + 2,
             solid_capstyle="round",
@@ -480,13 +506,27 @@ def draw_footprint_trajectory(ax, traj_states, zorder_base=6, stride=DISPLAY_FOO
         state = traj_states[idx]
         t = order_idx / n
         fill_color = lerp_color(DISPLAY_FOOTPRINT_START_COLOR, DISPLAY_FOOTPRINT_END_COLOR, t)
-        alpha = 0.34 if order_idx < len(sampled_idx) - 1 else 0.54
-        linewidth = 1.05 if order_idx < len(sampled_idx) - 1 else 1.2
+        if DISPLAY_FOOTPRINT_OUTLINE_ONLY:
+            facecolor = "none"
+            alpha = 0.78 if order_idx < len(sampled_idx) - 1 else 0.96
+            linewidth = (
+                DISPLAY_FOOTPRINT_OUTLINE_LINEWIDTH
+                if order_idx < len(sampled_idx) - 1
+                else DISPLAY_FOOTPRINT_OUTLINE_FINAL_LINEWIDTH
+            )
+        else:
+            facecolor = fill_color
+            alpha = 0.34 if order_idx < len(sampled_idx) - 1 else 0.54
+            linewidth = (
+                DISPLAY_FOOTPRINT_FILL_LINEWIDTH
+                if order_idx < len(sampled_idx) - 1
+                else DISPLAY_FOOTPRINT_FILL_FINAL_LINEWIDTH
+            )
         ax.add_patch(
             PolygonPatch(
                 state_box_coords(state),
                 closed=True,
-                facecolor=fill_color,
+                facecolor=facecolor,
                 edgecolor=DISPLAY_FOOTPRINT_EDGE,
                 linewidth=linewidth,
                 alpha=alpha,
@@ -748,9 +788,17 @@ def draw_case(ax, scene_label, result, show_legend=False, show_axis_labels=False
 
     if show_legend:
         if trajectory_style == "footprints":
+            footprint_facecolor = "none" if DISPLAY_FOOTPRINT_OUTLINE_ONLY else DISPLAY_FOOTPRINT_START_COLOR
             handles = [
                 Line2D([0], [0], color=DISPLAY_FOOTPRINT_LINE_COLOR, lw=1.6, label="path"),
-                PolygonPatch([[0, 0], [1, 0], [1, 0.5], [0, 0.5]], closed=True, facecolor=DISPLAY_FOOTPRINT_START_COLOR, edgecolor=DISPLAY_FOOTPRINT_EDGE, linewidth=1.0, label="vehicle footprint"),
+                PolygonPatch(
+                    [[0, 0], [1, 0], [1, 0.5], [0, 0.5]],
+                    closed=True,
+                    facecolor=footprint_facecolor,
+                    edgecolor=DISPLAY_FOOTPRINT_EDGE,
+                    linewidth=1.0,
+                    label="vehicle footprint",
+                ),
             ]
         else:
             handles = [

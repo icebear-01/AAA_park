@@ -170,17 +170,14 @@ class CarParkingOut(CarParking):
         assert mode in self.metadata["render_mode"]
         assert self.vehicle is not None
 
-        if mode == "human":
-            display_flags = pygame.SHOWN
-        else:
-            if not os.environ.get("DISPLAY") and not os.environ.get("SDL_VIDEODRIVER"):
-                os.environ["SDL_VIDEODRIVER"] = "dummy"
-            display_flags = pygame.HIDDEN
         if self.screen is None:
             pygame.init()
-            pygame.display.init()
-            self.screen = pygame.display.set_mode((WIN_W, WIN_H), flags=display_flags)
-        if self.clock is None:
+            if mode == "human":
+                pygame.display.init()
+                self.screen = pygame.display.set_mode((WIN_W, WIN_H), flags=pygame.SHOWN)
+            else:
+                self.screen = pygame.Surface((WIN_W, WIN_H))
+        if self.clock is None and mode == "human":
             self.clock = pygame.time.Clock()
 
         self._render(self.screen)
@@ -192,8 +189,9 @@ class CarParkingOut(CarParking):
         if self.use_action_mask:
             observation['action_mask'] = self.action_filter.get_steps(observation['lidar'])
         observation['target'] = self._get_targt_repr()
-        pygame.display.update()
-        self.clock.tick(self.fps)
+        if mode == "human":
+            pygame.display.update()
+            self.clock.tick(self.fps)
         return observation
 
     def step(self, action=None):
